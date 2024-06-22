@@ -2,6 +2,9 @@
 /explore
 /data
 /weights
+*.yaml
+*.pickle
+.vscode/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
