@@ -48,26 +48,41 @@ class Segmenter():
         return mask_generator
             
     def bounding_boxes(self,mask,img):
-        x1 = mask['bbox'][0]
-        y1 = mask['bbox'][1]
-        width = mask['bbox'][0] + mask['bbox'][2]
-        length = mask['bbox'][1] + mask['bbox'][3]        
-        cropped_img = img[y1:length,x1:width]
+        self.x1 = mask['bbox'][0]
+        self.y1 = mask['bbox'][1]
+        self.length = self.x1 + mask['bbox'][2]
+        self.height = self.y1 + mask['bbox'][3]        
+        cropped_img = img[self.y1:self.height,self.x1:self.length]
         return cropped_img
-    
-    def segmentation_mask(self,mask,data):
-        """
-        write img to source file shrunk to bouding box
-        segmentation mask json include:
-        {img: "bounding box img path"
-        mask location: [boolean array size of img]"}
-        """
-        pass
+
+    def _annotation_init(self,filename,data):
+        self.annotation = {}
+        self.annotation["images"] = {
+                                        "file_name": filename,
+                                        "height": data.shape[0],
+                                        "width": data.shape[1],
+                                    }
+        self.annotation_list = []
+
+    def _write_annotation(self,cropped_img_path):
+        annoation = {
+                        "filename": cropped_img_path,
+                        "segmentation" : self.img_metadata["segmentation"][self.y1:self.height,self.x1:self.length].tolist(),
+                        "bbox" : self.img_metadata["bbox"]
+                    }
+        self.annotation_list.append(annoation)
+
+    def _save_annotation(self,img_path):
+        self.annotation["annotation"] = self.annotation_list
+        json_filename = os.path.join(self.dest_directory,f'{os.path.basename(self.annotation["images"]["file_name"]).split(".")[0]}_.json')
+        with open(json_filename, "w") as outfile:
+            json_object = json.dumps(self.annotation)
+            outfile.write(json_object)
     
     def get_masks(self,mask_generator,img_path,cached = True):
         img = Image.open(img_path)
         data = asarray(img)
-        if cached:
+        if cached:  
             if img_path not in self.cache:
                 masks = mask_generator.generate(data)
                 self.cache[img_path] = masks
@@ -75,6 +90,7 @@ class Segmenter():
                 masks = self.cache[img_path]
         else:
             masks = mask_generator.generate(data)
+        self._annotation_init(img_path,data)
         return data, masks
 
     def run(self):
@@ -89,8 +105,10 @@ class Segmenter():
                 self.img_metadata["segmentation"] = mask["segmentation"]
                 cropped_img = self.bounding_boxes(mask,data)
                 im = Image.fromarray(cropped_img)
-                im.save(os.path.join(self.dest_directory,f'cropped_img_{os.path.basename(img_path).split(".")[0]}_{num}.jpg'))
-                self.segmentation_mask(mask,data)
+                cropped_img_path = os.path.join(self.dest_directory,f'cropped_img_{os.path.basename(img_path).split(".")[0]}_{num}.jpg')
+                im.save(cropped_img_path)
+                self._write_annotation(cropped_img_path)
+            self._save_annotation(cropped_img_path)
         self._update_cache()
 
     """
