@@ -1,3 +1,0 @@
-def cache(var):
-    cache = {}
-    

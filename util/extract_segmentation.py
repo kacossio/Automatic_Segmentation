@@ -4,10 +4,7 @@ Used to extract bounding boxes and segmentation masks using Segement Anything
 
 from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
 from PIL import Image
-from numpy import asarray
-from matplotlib import pyplot as plt
 import numpy as np
-import torch
 from pathlib import Path
 import yaml
 import os
@@ -81,7 +78,7 @@ class Segmenter():
     
     def get_masks(self,mask_generator,img_path,cached = True):
         img = Image.open(img_path)
-        data = asarray(img)
+        data = np.asarray(img)
         if cached:  
             if img_path not in self.cache:
                 masks = mask_generator.generate(data)
