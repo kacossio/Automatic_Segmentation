@@ -108,10 +108,5 @@ class Segmenter():
             self._save_annotation(cropped_img_path)
         self._update_cache()
 
-    """
-    TO DO: using masks - call bounding_boxes and segemention_mask to get write metadata and image to dest location
-            Initialize cache file on very first run
-            Better persisent cacheing of masks
-    """
 
 
