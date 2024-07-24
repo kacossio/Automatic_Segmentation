@@ -24,16 +24,21 @@ class Segmenter():
         self.source_directory = self.config["source_directory"]
         self.dest_directory = self.config["dest_directory"]
         self.model_weight = self.config["model_weights"]
-        self.cache_file = self.config["cache_file"]
+        if "cache_file" in self.config.keys():
+            self.cache_flag = True
+            self.cache_file = self.config["cache_file"]
+        else:
+            self.cache_flag = False
         self.cache = {}
-        with open(self.cache_file, 'rb') as openfile:
-            self.cache = pickle.load(openfile)
+        if self.cache_flag:
+            with open(self.cache_file, 'rb') as openfile:
+                self.cache = pickle.load(openfile)
         self.metadata = {}
-        pass
 
     def _update_cache(self):
-        with open(self.cache_file, 'wb') as f:
-            pickle.dump(self.cache,f)
+        if self.cache_flag:
+            with open(self.cache_file, 'wb') as f:
+                pickle.dump(self.cache,f)
 
     def load_model(self):
         sam = sam_model_registry["vit_h"](checkpoint=self.model_weight)
@@ -76,10 +81,10 @@ class Segmenter():
             json_object = json.dumps(self.annotation)
             outfile.write(json_object)
     
-    def get_masks(self,mask_generator,img_path,cached = True):
+    def get_masks(self,mask_generator,img_path):
         img = Image.open(img_path)
         data = np.asarray(img)
-        if cached:  
+        if self.cache_flag:  
             if img_path not in self.cache:
                 masks = mask_generator.generate(data)
                 self.cache[img_path] = masks
