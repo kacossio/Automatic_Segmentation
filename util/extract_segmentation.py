@@ -11,7 +11,7 @@ import os
 import glob
 import json
 import pickle
-from typing import Type, List, Dict
+from typing import Type, List, Dict, Tuple
 
 class Segmenter():
 
@@ -127,7 +127,7 @@ class Segmenter():
             json_object = json.dumps(self.annotation)
             outfile.write(json_object)
     
-    def get_masks(self,mask_generator: Type[SamAutomaticMaskGenerator] ,img_path: str) -> tuple[np.ndarray,List[Dict]]:
+    def get_masks(self,mask_generator: Type[SamAutomaticMaskGenerator] ,img_path: str) -> Tuple[np.ndarray,List[Dict]]:
         """
         Runs image through SAM mask generator 
 
@@ -136,7 +136,7 @@ class Segmenter():
             img_path(str): A string of the path of the image
 
         Returns:
-            tuple[np.ndarray,List[Dict]]: Returns an array of the original image and a list of dictionaries including masks
+            Tuple[np.ndarray,List[Dict]]: Returns an array of the original image and a list of dictionaries including masks
         """
 
         img = Image.open(img_path)
@@ -168,6 +168,7 @@ class Segmenter():
                 im.save(cropped_img_path)
                 self.write_annotation(cropped_img_path)
             self.save_annotation()
+            print(f"file {img_path} is complete")
         self._update_cache()
 
 
