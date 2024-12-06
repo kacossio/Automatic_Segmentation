@@ -93,7 +93,7 @@ class Segmenter():
 
     def _annotation_init(self,filename: str, data: np.ndarray):
         """
-        Initialize annotation file with the filename and image size
+        Initialize segmentation and classification annotation file with the filename and image size
 
         Arguments:
             filename(str): A string with the filename of the original image
@@ -106,7 +106,8 @@ class Segmenter():
                                         "height": data.shape[0],
                                         "width": data.shape[1],
                                     }
-        self.annotation_list = []
+        self.seg_annotation_list = []
+        self.classification_annotation_list = []
 
     def write_annotation(self,cropped_img_path: str):
         """
@@ -116,22 +117,32 @@ class Segmenter():
             cropped_img_path(str): A string of the path for the cropped image file location
         """
 
-        annoation = {
+        seg_annoation = {
                         "filename": cropped_img_path,
-                        "class_id": 0,
                         "segmentation" : self.img_metadata["segmentation"][self.y1:self.height,self.x1:self.length].tolist(),
                         "bbox" : self.img_metadata["bbox"]
                     }
-        self.annotation_list.append(annoation)
+        class_annoation = {
+                "filename": cropped_img_path,
+                "class_id": 0
+            }
+        self.seg_annotation_list.append(seg_annoation)
+        self.classification_annotation_list.append(class_annoation)
 
     def save_annotation(self):
         """
         Writes annotation json file based on destination location on yaml file 
         """
 
-        self.annotation["annotation"] = self.annotation_list
-        json_filename = os.path.join(self.dest_directory,f'{os.path.basename(self.annotation["images"]["file_name"]).split(".")[0]}_.json')
-        with open(json_filename, "w") as outfile:
+        self.annotation["annotation"] = self.seg_annotation_list
+        seg_json_filename = os.path.join(self.dest_directory,f'{os.path.basename(self.annotation["images"]["file_name"]).split(".")[0]}_seg.json')
+        with open(seg_json_filename, "w") as outfile:
+            json_object = json.dumps(self.annotation)
+            outfile.write(json_object)
+        
+        self.annotation["annotation"] = self.classification_annotation_list
+        class_json_filename = os.path.join(self.dest_directory,f'{os.path.basename(self.annotation["images"]["file_name"]).split(".")[0]}_class.json')
+        with open(class_json_filename, "w") as outfile:
             json_object = json.dumps(self.annotation)
             outfile.write(json_object)
     
