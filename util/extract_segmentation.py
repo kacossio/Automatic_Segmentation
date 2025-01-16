@@ -13,6 +13,7 @@ import glob
 import json
 import pickle
 from tqdm import tqdm
+
 from typing import Type, List, Dict, Tuple
 
 class Segmenter():
@@ -61,13 +62,16 @@ class Segmenter():
             with open(self.cache_file, 'wb') as f:
                 pickle.dump(self.cache,f)
 
+
     def load_model(self) -> Type[SAM2AutomaticMaskGenerator]:
+
         """
         Loads sam model using defined weights from config.yaml
 
         Returns:
             Type[SamAutomaticMaskGenerator]: SamAutomaticMaskGenerator instance 
         """
+        
         sam2 = build_sam2(self.model_config, self.model_weights, device=self.device, apply_postprocessing=False)
         mask_generator = SAM2AutomaticMaskGenerator(sam2)
         return mask_generator

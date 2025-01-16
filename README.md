@@ -6,7 +6,8 @@ This project will segment images using facebook's Segment Anything model and wri
 
 I am running the nvidia pytorch container that matches my cuda setup. You can find the correct container here: https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch
 
-Once you have the correct container/enviroment, install segment anyting using steps from facebooks here: https://github.com/facebookresearch/segment-anything
+Once you have the correct container/enviroment, install segment anyting using steps from facebooks here: https://github.com/facebookresearch/segment-anything.
+Make sure to also download the weights to the model you will be using.
 
 ## Usage
 
