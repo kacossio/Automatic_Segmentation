@@ -1,8 +1,9 @@
 """
 Used to extract bounding boxes and segmentation masks using Segement Anything
 """
-
-from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
+from sam2.build_sam import build_sam2
+from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+import torch
 from PIL import Image
 import numpy as np
 from pathlib import Path
@@ -11,6 +12,8 @@ import os
 import glob
 import json
 import pickle
+from tqdm import tqdm
+
 from typing import Type, List, Dict, Tuple
 
 class Segmenter():
@@ -28,7 +31,17 @@ class Segmenter():
 
         self.source_directory = self.config["source_directory"]
         self.dest_directory = self.config["dest_directory"]
-        self.model_weight = self.config["model_weights"]
+        self.model_weights = self.config["model_weights"]
+        self.model_config = self.config["model_config"]
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+            torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
+            if torch.cuda.get_device_properties(0).major >= 8:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+        else:
+            self.device = torch.device("cpu")
+        print(f"using device: {self.device}")
         if "cache_file" in self.config.keys():
             self.cache_flag = True
             self.cache_file = self.config["cache_file"]
@@ -49,20 +62,18 @@ class Segmenter():
             with open(self.cache_file, 'wb') as f:
                 pickle.dump(self.cache,f)
 
-    def load_model(self) -> Type[SamAutomaticMaskGenerator]:
+
+    def load_model(self) -> Type[SAM2AutomaticMaskGenerator]:
+
         """
         Loads sam model using defined weights from config.yaml
 
         Returns:
             Type[SamAutomaticMaskGenerator]: SamAutomaticMaskGenerator instance 
         """
-
-        sam = sam_model_registry["vit_h"](checkpoint=self.model_weight)
-        try:
-            sam.to(device = "cuda")
-        except:
-            print("no cuda")
-        mask_generator = SamAutomaticMaskGenerator(sam)
+        
+        sam2 = build_sam2(self.model_config, self.model_weights, device=self.device, apply_postprocessing=False)
+        mask_generator = SAM2AutomaticMaskGenerator(sam2)
         return mask_generator
             
     def bounding_boxes(self,mask: List[Dict],img: np.ndarray) -> np.ndarray:
@@ -77,16 +88,16 @@ class Segmenter():
             np.ndarray: An array of the cropped image that fits the bounding box
         """
 
-        self.x1 = mask['bbox'][0]
-        self.y1 = mask['bbox'][1]
-        self.length = self.x1 + mask['bbox'][2]
-        self.height = self.y1 + mask['bbox'][3]        
+        self.x1 = int(mask['bbox'][0])
+        self.y1 = int(mask['bbox'][1])
+        self.length = self.x1 + int(mask['bbox'][2])
+        self.height = self.y1 + int(mask['bbox'][3])        
         cropped_img = img[self.y1:self.height,self.x1:self.length]
         return cropped_img
 
     def _annotation_init(self,filename: str, data: np.ndarray):
         """
-        Initialize annotation file with the filename and image size
+        Initialize segmentation and classification annotation file with the filename and image size
 
         Arguments:
             filename(str): A string with the filename of the original image
@@ -99,7 +110,8 @@ class Segmenter():
                                         "height": data.shape[0],
                                         "width": data.shape[1],
                                     }
-        self.annotation_list = []
+        self.seg_annotation_list = []
+        self.classification_annotation_list = []
 
     def write_annotation(self,cropped_img_path: str):
         """
@@ -109,25 +121,36 @@ class Segmenter():
             cropped_img_path(str): A string of the path for the cropped image file location
         """
 
-        annoation = {
+        seg_annoation = {
                         "filename": cropped_img_path,
                         "segmentation" : self.img_metadata["segmentation"][self.y1:self.height,self.x1:self.length].tolist(),
                         "bbox" : self.img_metadata["bbox"]
                     }
-        self.annotation_list.append(annoation)
+        class_annoation = {
+                "filename": cropped_img_path,
+                "class_id": 0
+            }
+        self.seg_annotation_list.append(seg_annoation)
+        self.classification_annotation_list.append(class_annoation)
 
     def save_annotation(self):
         """
         Writes annotation json file based on destination location on yaml file 
         """
 
-        self.annotation["annotation"] = self.annotation_list
-        json_filename = os.path.join(self.dest_directory,f'{os.path.basename(self.annotation["images"]["file_name"]).split(".")[0]}_.json')
-        with open(json_filename, "w") as outfile:
+        self.annotation["annotation"] = self.seg_annotation_list
+        seg_json_filename = os.path.join(self.dest_directory,f'{os.path.basename(self.annotation["images"]["file_name"]).split(".")[0]}_seg.json')
+        with open(seg_json_filename, "w") as outfile:
+            json_object = json.dumps(self.annotation)
+            outfile.write(json_object)
+        
+        self.annotation["annotation"] = self.classification_annotation_list
+        class_json_filename = os.path.join(self.dest_directory,f'{os.path.basename(self.annotation["images"]["file_name"]).split(".")[0]}_class.json')
+        with open(class_json_filename, "w") as outfile:
             json_object = json.dumps(self.annotation)
             outfile.write(json_object)
     
-    def get_masks(self,mask_generator: Type[SamAutomaticMaskGenerator] ,img_path: str) -> Tuple[np.ndarray,List[Dict]]:
+    def get_masks(self,mask_generator: Type[SAM2AutomaticMaskGenerator] ,img_path: str) -> Tuple[np.ndarray,List[Dict]]:
         """
         Runs image through SAM mask generator 
 
@@ -155,7 +178,7 @@ class Segmenter():
     def run(self):
         mask_generator = self.load_model()
         root_path = self.source_directory
-        for img_path in glob.glob(root_path + '/*.jpg'):
+        for img_path in tqdm(glob.glob(root_path + '/*.jpg')):
             assert img_path.split(".")[-1] == "jpg", "File is not JPG"
             data, masks = self.get_masks(mask_generator,img_path)
             for num, mask in enumerate(masks):
