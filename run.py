@@ -1,6 +1,5 @@
-import util.extract_segmentation
+import util.segmentation
 
-if __name__=="__main__":
-
-    Segmenter = util.extract_segmentation.Segmenter(config="config.yaml")
-    Segmenter.run()
+if __name__ == "__main__":
+    segmenter = util.segmentation.Segmenter(config="config.yaml")
+    segmenter.run()
