@@ -18,6 +18,36 @@ import yaml
 from pycocotools import mask as coco_mask
 
 
+def coco_anns_to_detections(anns, h, w, cats):
+    """COCO annotation dicts -> (sv.Detections, labels list).
+
+    Decodes COCO RLE segmentation back into boolean masks and rehydrates an
+    sv.Detections. ``confidence`` is taken from each annotation's optional
+    ``score`` field (default 1.0). ``cats`` maps category_id -> class name.
+    Shared by render_overlays() and review.py.
+    """
+    xyxy, masks, class_ids, labels, conf = [], [], [], [], []
+    for a in anns:
+        x, y, bw, bh = a["bbox"]
+        xyxy.append([x, y, x + bw, y + bh])
+        rle = coco_mask.frPyObjects(a["segmentation"], h, w)
+        m = coco_mask.decode(rle)
+        if m.ndim == 3:
+            m = m[:, :, 0]
+        masks.append(m.astype(bool))
+        class_ids.append(a["category_id"])
+        labels.append(cats[a["category_id"]])
+        conf.append(float(a.get("score", 1.0)))
+
+    det = sv.Detections(
+        xyxy=np.array(xyxy, dtype=float),
+        mask=np.stack(masks),
+        class_id=np.array(class_ids, dtype=int),
+        confidence=np.array(conf, dtype=float),
+    )
+    return det, labels
+
+
 def render_overlays(config_path: str) -> Path:
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
@@ -56,24 +86,7 @@ def render_overlays(config_path: str) -> Path:
             print(f"  {info['file_name']}: 0 annotations")
             continue
 
-        xyxy, masks, class_ids, labels = [], [], [], []
-        for a in anns:
-            x, y, bw, bh = a["bbox"]
-            xyxy.append([x, y, x + bw, y + bh])
-            rle = coco_mask.frPyObjects(a["segmentation"], h, w)
-            m = coco_mask.decode(rle)
-            if m.ndim == 3:
-                m = m[:, :, 0]
-            masks.append(m.astype(bool))
-            class_ids.append(a["category_id"])
-            labels.append(cats[a["category_id"]])
-
-        det = sv.Detections(
-            xyxy=np.array(xyxy, dtype=float),
-            mask=np.stack(masks),
-            class_id=np.array(class_ids, dtype=int),
-            confidence=np.ones(len(anns)),
-        )
+        det, labels = coco_anns_to_detections(anns, h, w, cats)
 
         out = img.copy()
         out = mask_ann.annotate(out, det)

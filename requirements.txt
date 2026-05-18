@@ -9,6 +9,10 @@ PyYAML>=6.0
 tqdm>=4.0
 Pillow>=9.0
 
+# Annotation review UI (review.py)
+streamlit>=1.30
+streamlit-image-coordinates>=0.1.6
+
 # Install PyTorch with CUDA *before* running pip install -r requirements.txt.
 # Example (CUDA 12.4):
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
