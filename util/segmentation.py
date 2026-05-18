@@ -2,7 +2,9 @@
 Text-prompted image segmentation using HF Grounding DINO + SAM2.
 Produces COCO JSON output from per-image masks.
 """
+import json
 import os
+import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -55,15 +57,54 @@ class Segmenter:
         return processor, dino, sam
 
     def _label_to_class_id(self, label: str) -> Optional[int]:
+        """Map a Grounding DINO text label to an ontology class id.
+
+        Grounding DINO grounds boxes to *token spans*, so for a multi-word
+        prompt it usually returns a sub-phrase (e.g. "player" for the prompt
+        "soccer player") and drops words that are ambiguous across prompts
+        (e.g. "soccer", which is shared by player/ball/field). Matching must
+        therefore be word-level and bidirectional, not full-phrase exact.
+        """
         label = label.lower().strip()
+        if not label:
+            return None
+
+        # 1. Exact phrase match.
         if label in self.prompt_to_class_id:
             return self.prompt_to_class_id[label]
-        # Fallback: longest prompt that appears as substring of label
-        best: Optional[str] = None
-        for p in self.prompts:
-            if p in label and (best is None or len(p) > len(best)):
-                best = p
-        return self.prompt_to_class_id[best] if best else None
+
+        label_words = set(re.findall(r"[a-z]+", label))
+        if not label_words:
+            return None
+
+        # 2. Word-overlap scoring. The best prompt is the one sharing the most
+        #    words with the label; a tie between *different* classes means the
+        #    label is ambiguous (e.g. bare "soccer") -> drop rather than guess.
+        def words_match(a: str, b: str) -> bool:
+            # Exact, or substring-either-direction for plural / affixed
+            # variants ("players" vs "player"). Length guard avoids noise
+            # like matching "a" inside "ball".
+            if a == b:
+                return True
+            return min(len(a), len(b)) >= 4 and (a in b or b in a)
+
+        best_cid: Optional[int] = None
+        best_score = 0
+        ambiguous = False
+        for p, cid in self.prompt_to_class_id.items():
+            prompt_words = set(re.findall(r"[a-z]+", p))
+            score = sum(
+                any(words_match(lw, pw) for pw in prompt_words)
+                for lw in label_words
+            )
+            if score > best_score:
+                best_score, best_cid, ambiguous = score, cid, False
+            elif score == best_score and score > 0 and cid != best_cid:
+                ambiguous = True
+
+        if best_score == 0 or ambiguous:
+            return None
+        return best_cid
 
     def predict_image(self, image_path: str, processor, dino, sam) -> sv.Detections:
         pil_image = Image.open(image_path).convert("RGB")
@@ -170,4 +211,37 @@ class Segmenter:
 
         coco_path = Path(self.dest_directory) / "annotations.json"
         dataset.as_coco(annotations_path=str(coco_path))
+
+        # supervision's as_coco() does not persist Detections.confidence.
+        # Re-load the JSON and attach each detection's score as a custom field.
+        # as_coco writes annotations grouped per image in detection-index order,
+        # which matches the order of each Detections.confidence array.
+        with open(coco_path) as f:
+            coco = json.load(f)
+
+        scores_by_filename: Dict[str, List[float]] = {
+            Path(p).name: (
+                det.confidence.tolist()
+                if det.confidence is not None and len(det) > 0
+                else []
+            )
+            for p, det in annotations.items()
+        }
+        id_to_filename = {img["id"]: img["file_name"] for img in coco["images"]}
+
+        per_image_idx: Dict[int, int] = {}
+        for a in coco["annotations"]:
+            fn = id_to_filename.get(a["image_id"])
+            scores = scores_by_filename.get(fn, [])
+            i = per_image_idx.get(a["image_id"], 0)
+            if i < len(scores):
+                a["score"] = float(scores[i])
+            else:
+                a["score"] = -1.0
+                print(f"WARNING: score count mismatch for '{fn}'; set score=-1.0")
+            per_image_idx[a["image_id"]] = i + 1
+
+        with open(coco_path, "w") as f:
+            json.dump(coco, f, indent=2)
+
         print(f"Done. COCO annotations written to: {coco_path}")
