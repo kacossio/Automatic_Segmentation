@@ -12,6 +12,7 @@ Pillow>=9.0
 # Annotation review UI (review.py)
 streamlit>=1.30
 streamlit-image-coordinates>=0.1.6
+streamlit-shortcuts>=0.1.9  # optional keyboard nav; review.py degrades if absent
 
 # Install PyTorch with CUDA *before* running pip install -r requirements.txt.
 # Example (CUDA 12.4):
