@@ -21,17 +21,28 @@ from pycocotools import mask as coco_mask
 def coco_anns_to_detections(anns, h, w, cats):
     """COCO annotation dicts -> (sv.Detections, labels list).
 
-    Decodes COCO RLE segmentation back into boolean masks and rehydrates an
+    Decodes COCO segmentation back into boolean masks and rehydrates an
     sv.Detections. ``confidence`` is taken from each annotation's optional
     ``score`` field (default 1.0). ``cats`` maps category_id -> class name.
     Shared by render_overlays() and review.py.
+
+    Handles both segmentation encodings: polygons / uncompressed RLE (the
+    labeler's supervision output, via ``frPyObjects``) and compressed RLE
+    (masks added in review.py, where ``counts`` is a str/bytes blob that
+    ``frPyObjects`` cannot parse and must be decoded directly).
     """
     xyxy, masks, class_ids, labels, conf = [], [], [], [], []
     for a in anns:
         x, y, bw, bh = a["bbox"]
         xyxy.append([x, y, x + bw, y + bh])
-        rle = coco_mask.frPyObjects(a["segmentation"], h, w)
-        m = coco_mask.decode(rle)
+        seg = a["segmentation"]
+        if isinstance(seg, dict) and isinstance(seg.get("counts"), (str, bytes)):
+            rle = dict(seg)
+            if isinstance(rle["counts"], str):
+                rle["counts"] = rle["counts"].encode("ascii")
+            m = coco_mask.decode(rle)
+        else:
+            m = coco_mask.decode(coco_mask.frPyObjects(seg, h, w))
         if m.ndim == 3:
             m = m[:, :, 0]
         masks.append(m.astype(bool))

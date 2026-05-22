@@ -14,6 +14,7 @@ configured output directory.
 """
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -22,7 +23,14 @@ import numpy as np
 import streamlit as st
 import supervision as sv
 import yaml
+from pycocotools import mask as coco_mask
 from streamlit_image_coordinates import streamlit_image_coordinates
+
+# NOTE: torch / sam2 are imported lazily inside load_sam(), NOT at module top.
+# Streamlit's source watcher walks every imported module's __path__, and
+# torch.classes.__path__._path raises (RuntimeError: Tried to instantiate
+# class '__path__._path'), which crashes the app on every rerun. Deferring the
+# import keeps pure review torch-free; load_sam() also silences the watcher.
 
 from util.render_overlays import coco_anns_to_detections
 
@@ -43,7 +51,10 @@ def parse_args():
 
 
 @st.cache_data(show_spinner=False)
-def load_coco(config_path: str):
+def load_coco(config_path: str, coco_mtime: float):
+    # coco_mtime is unused inside but participates in the cache key: re-running
+    # the labeler changes annotations.json's mtime and invalidates this cache,
+    # so the UI never shows stale annotations.
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
     src = Path(cfg["source_directory"])
@@ -82,6 +93,74 @@ def load_frame(img_path: str, _anns, _cats, cache_key: str):
     return img, det, labels
 
 
+@st.cache_resource(show_spinner="Loading SAM2 (first add only)…")
+def load_sam(sam2_model: str):
+    """Lazily load SAM2 for the click-to-add flow.
+
+    Only invoked the first time the reviewer adds an object, so pure
+    review on a CPU-only box never pays the model-load cost — and, crucially,
+    torch is not imported until then so Streamlit's file watcher never trips
+    over torch.classes.
+    """
+    import torch
+    from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+    # Stop Streamlit's source watcher from walking torch.classes.__path__
+    # (raises RuntimeError on every rerun once torch is imported).
+    try:
+        torch.classes.__path__ = []
+    except Exception:
+        pass
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    return SAM2ImagePredictor.from_pretrained(sam2_model, device=device), device
+
+
+def sam_mask_at_point(sam, bgr_image, ox: int, oy: int) -> np.ndarray:
+    """Point-prompt SAM2 at (ox, oy); return the best-scoring boolean mask."""
+    import torch  # already loaded by load_sam(); import is cached/cheap
+
+    rgb = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+    with torch.inference_mode():
+        sam.set_image(rgb)
+        masks, scores, _ = sam.predict(
+            point_coords=np.array([[ox, oy]]),
+            point_labels=np.array([1]),
+            multimask_output=True,
+        )
+    return masks[int(np.argmax(scores))].astype(bool)
+
+
+def make_added_ann(ann_id: int, image_id: int, mask: np.ndarray, category_id: int):
+    """Build a COCO annotation (compressed RLE) for a human-added mask.
+
+    ``score`` is 1.0 and ``category_id`` defaults to the UNKNOWN class so the
+    reviewer must explicitly classify it via the existing dropdown.
+    """
+    rle = coco_mask.encode(np.asfortranarray(mask.astype(np.uint8)))
+    ys, xs = np.where(mask)
+    x0, y0 = int(xs.min()), int(ys.min())
+    bw, bh = int(xs.max()) - x0 + 1, int(ys.max()) - y0 + 1
+    return {
+        "id": ann_id,
+        "image_id": image_id,
+        "category_id": category_id,
+        "bbox": [x0, y0, bw, bh],
+        "area": int(mask.sum()),
+        "iscrowd": 0,
+        "segmentation": {
+            "size": [int(mask.shape[0]), int(mask.shape[1])],
+            "counts": rle["counts"].decode("ascii"),
+        },
+        "score": 1.0,
+    }
+
+
+def all_anns(per_img: dict, img_id: int) -> list:
+    """Labeler detections for a frame plus any human-added ones (session)."""
+    return per_img.get(img_id, []) + st.session_state.get("added", {}).get(img_id, [])
+
+
 # --------------------------------------------------------------------------- #
 # State persistence (review_state.json)
 # --------------------------------------------------------------------------- #
@@ -97,6 +176,8 @@ def init_state(dest: str, per_img: dict, images: list):
     """Hydrate decisions + reviewed set, resuming from disk if present."""
     decisions: dict[str, dict] = {}
     reviewed: set[int] = set()
+    added: dict[int, list] = {}
+    next_added_id = -1  # human-added anns use decreasing negative ids
 
     sp = state_path(dest)
     if sp.exists():
@@ -104,11 +185,19 @@ def init_state(dest: str, per_img: dict, images: list):
             saved = json.load(f)
         decisions = saved.get("decisions", {})
         reviewed = set(saved.get("reviewed", []))
+        # JSON object keys are strings; restore int image-id keys.
+        added = {int(k): v for k, v in saved.get("added", {}).items()}
+        next_added_id = saved.get("next_added_id", -1)
 
-    # Ensure every annotation has a decision (inclusive default = keep).
+    st.session_state.added = added
+    st.session_state.next_added_id = next_added_id
+
+    # Ensure every annotation (incl. resumed human-added ones) has a decision
+    # (inclusive default = keep).
     for img in images:
-        for a in per_img.get(img["id"], []):
-            k = dkey(img["id"], a["id"])
+        iid = img["id"]
+        for a in per_img.get(iid, []) + added.get(iid, []):
+            k = dkey(iid, a["id"])
             if k not in decisions:
                 decisions[k] = {"keep": True, "class_id": a["category_id"]}
 
@@ -125,6 +214,8 @@ def save_state(dest: str):
             {
                 "decisions": st.session_state.decisions,
                 "reviewed": sorted(st.session_state.reviewed),
+                "added": st.session_state.get("added", {}),
+                "next_added_id": st.session_state.get("next_added_id", -1),
             },
             f,
             indent=2,
@@ -135,9 +226,10 @@ def save_state(dest: str):
 def save_reviewed(dest: str, coco: dict, per_img: dict):
     """Write a clean, kept-only standard-COCO file (score retained)."""
     decisions = st.session_state.decisions
+    added = st.session_state.get("added", {})
     out_anns = []
-    for img_id, anns in per_img.items():
-        for a in anns:
+    for img_id in set(per_img) | set(added):
+        for a in per_img.get(img_id, []) + added.get(img_id, []):
             d = decisions.get(dkey(img_id, a["id"]))
             if not d or not d["keep"]:
                 continue
@@ -226,9 +318,17 @@ def main():
     st.set_page_config(page_title="Annotation Review", layout="wide")
     args = parse_args()
 
-    cfg, src, dest, coco, cats, images, per_img = load_coco(args.config)
+    # Cheap re-read of the config to locate annotations.json and stamp its
+    # mtime into the cache key (see load_coco).
+    with open(args.config) as f:
+        _dest = Path(yaml.safe_load(f)["dest_directory"])
+    coco_mtime = os.path.getmtime(_dest / "annotations.json")
+    cfg, src, dest, coco, cats, images, per_img = load_coco(args.config, coco_mtime)
     cat_names = [cats[cid] for cid in sorted(cats)]
     name_to_id = {cats[cid]: cid for cid in cats}
+    sam2_model = cfg.get("sam2_model", "facebook/sam2-hiera-large")
+    # Human-added detections default to UNKNOWN so the reviewer must classify.
+    unknown_cid = name_to_id.get("unknown", sorted(cats)[0])
 
     if "decisions" not in st.session_state:
         init_state(dest, per_img, images)
@@ -238,7 +338,7 @@ def main():
     idx = st.session_state.current_idx
     img_meta = images[idx]
     img_id = img_meta["id"]
-    anns = per_img.get(img_id, [])
+    anns = all_anns(per_img, img_id)
 
     # ---- Top bar -------------------------------------------------------- #
     c1, c2, c3, c4 = st.columns([3, 1, 1, 3])
@@ -247,9 +347,8 @@ def main():
     c2.markdown(f"image **{idx + 1} / {n}**")
 
     def go(new_idx: int):
-        if img_id not in st.session_state.reviewed:
-            st.session_state.reviewed.add(img_id)  # leaving = reviewed
-            st.session_state.dirty = True
+        # Navigation no longer auto-marks a frame reviewed: "reviewed" must be
+        # an explicit action so progress is honest against a 100% bar.
         st.session_state.current_idx = max(0, min(n - 1, new_idx))
         if st.session_state.dirty:  # skip the full-state write when nothing changed
             save_state(dest)
@@ -259,6 +358,15 @@ def main():
         go(idx - 1)
     if c3.button("Next ▶", disabled=idx == n - 1, width="stretch"):
         go(idx + 1)
+    if c3.button(
+        "✔ Mark reviewed",
+        width="stretch",
+        disabled=img_id in st.session_state.reviewed,
+    ):
+        st.session_state.reviewed.add(img_id)
+        st.session_state.dirty = True
+        save_state(dest)
+        st.rerun()
     jump = c4.selectbox(
         "Jump to",
         range(n),
@@ -270,7 +378,11 @@ def main():
         go(jump)
 
     img_path = str(Path(src) / img_meta["file_name"])
-    image, det, labels = load_frame(img_path, anns, cats, str(img_id))
+    # Cache key includes the detection count so a freshly added mask busts the
+    # per-frame cache and is decoded/shown on the next run.
+    image, det, labels = load_frame(
+        img_path, anns, cats, f"{img_id}:{len(anns)}"
+    )
 
     main_col, side_col = st.columns([3, 1])
     order = sorted(range(len(anns)), key=lambda i: float(anns[i].get("score", 1.0)))
@@ -302,13 +414,21 @@ def main():
     with main_col:
         if image is None:
             st.error(f"Image not found: {img_path}")
-        elif len(det) == 0:
-            st.image(image, channels="BGR", width="stretch")
-            st.caption("No detections on this frame.")
         else:
-            keep_arr = np.array(kept_mask, dtype=bool)
+            mode = st.radio(
+                "Click mode",
+                ["Select", "Add object"],
+                horizontal=True,
+                key="click_mode",
+                help="Select: inspect a detection. Add object: click a missed "
+                "object — SAM2 generates a mask the labeler never produced.",
+            )
+
             out = image.copy()
-            if keep_arr.any():
+            keep_arr = np.array(kept_mask, dtype=bool)
+            # Overlay only when there are kept detections; an empty frame still
+            # renders the raw image so a missed-everything frame is addable.
+            if len(det) and keep_arr.any():
                 shown = det[keep_arr]
                 ids = np.array(override_ids, dtype=int)[keep_arr]
                 shown.class_id = ids
@@ -342,17 +462,51 @@ def main():
                 rgb, key=f"img::{img_id}", use_column_width="always"
             )
             st.caption(
-                "Click an object to select it — its controls pin to the top "
-                "of the sidebar."
+                "Select: click an object to inspect it. "
+                "Add object: click a missed object — SAM2 makes a mask "
+                "(defaults to “unknown”; classify it in the sidebar)."
             )
-            if click is not None and click.get("width"):
+            # The component re-emits the last click on every rerun; only act
+            # on a *new* click so an add isn't repeated indefinitely.
+            last_key = f"_click::{img_id}"
+            if (
+                click is not None
+                and click.get("width")
+                and click != st.session_state.get(last_key)
+            ):
+                st.session_state[last_key] = click
                 ox = int(click["x"] * image.shape[1] / click["width"])
                 oy = int(click["y"] * image.shape[0] / click["height"])
-                hit = hit_test(det, kept_mask, ox, oy)
-                new_id = anns[hit]["id"] if hit is not None else sel_id
-                if new_id != sel_id:
-                    st.session_state.selected[img_id] = new_id
-                    st.rerun()
+                if mode == "Add object":
+                    sam, _device = load_sam(sam2_model)
+                    mask = sam_mask_at_point(sam, image, ox, oy)
+                    if not mask.any():
+                        # An all-false mask would crash make_added_ann's bbox
+                        # (xs.min() on an empty array); skip and tell the user.
+                        st.warning(
+                            "SAM2 returned an empty mask there — try clicking "
+                            "nearer the object's centre."
+                        )
+                    else:
+                        aid = st.session_state.next_added_id
+                        st.session_state.next_added_id -= 1
+                        st.session_state.added.setdefault(img_id, []).append(
+                            make_added_ann(aid, img_id, mask, unknown_cid)
+                        )
+                        st.session_state.decisions[dkey(img_id, aid)] = {
+                            "keep": True,
+                            "class_id": unknown_cid,
+                        }
+                        st.session_state.selected[img_id] = aid
+                        st.session_state.dirty = True
+                        save_state(dest)
+                        st.rerun()
+                else:
+                    hit = hit_test(det, kept_mask, ox, oy)
+                    new_id = anns[hit]["id"] if hit is not None else sel_id
+                    if new_id != sel_id:
+                        st.session_state.selected[img_id] = new_id
+                        st.rerun()
 
     # ---- Sidebar: selected pinned, then ascending-confidence list -------- #
     with side_col:
@@ -379,6 +533,22 @@ def main():
         path, kept_n = save_reviewed(dest, coco, per_img)
         st.success(f"Wrote {kept_n} kept annotations to {path}")
     f2.markdown(f"**{kept} / {total}** annotations kept across all frames")
+
+    # Optional keyboard shortcuts; silently degrade to buttons if the package
+    # isn't installed. Keys map to button labels rendered above.
+    try:
+        from streamlit_shortcuts import add_keyboard_shortcuts
+
+        add_keyboard_shortcuts(
+            {
+                "ArrowLeft": "◀ Prev",
+                "ArrowRight": "Next ▶",
+                "r": "✔ Mark reviewed",
+                "s": "💾 Save reviewed.json",
+            }
+        )
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
