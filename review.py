@@ -32,7 +32,7 @@ from streamlit_image_coordinates import streamlit_image_coordinates
 # class '__path__._path'), which crashes the app on every rerun. Deferring the
 # import keeps pure review torch-free; load_sam() also silences the watcher.
 
-from util.render_overlays import coco_anns_to_detections
+from util.render_overlays import annotate_detections, coco_anns_to_detections
 
 # Max width (px) of the frame sent to the browser-side click component.
 # Hit-testing stays full-resolution; only the displayed copy is shrunk.
@@ -415,13 +415,22 @@ def main():
         if image is None:
             st.error(f"Image not found: {img_path}")
         else:
-            mode = st.radio(
+            mode_col, zoom_col = st.columns([2, 1])
+            mode = mode_col.radio(
                 "Click mode",
                 ["Select", "Add object"],
                 horizontal=True,
                 key="click_mode",
                 help="Select: inspect a detection. Add object: click a missed "
                 "object — SAM2 generates a mask the labeler never produced.",
+            )
+            st.session_state.setdefault("zoom", 1.0)
+            zoom = zoom_col.select_slider(
+                "🔍 Zoom",
+                options=[1.0, 1.5, 2.0, 3.0, 4.0],
+                key="zoom",
+                help="Crop around the selected detection (or image centre "
+                "if none) so the object covers more of the screen.",
             )
 
             out = image.copy()
@@ -433,17 +442,33 @@ def main():
                 ids = np.array(override_ids, dtype=int)[keep_arr]
                 shown.class_id = ids
                 shown_labels = [cats[c] for c in ids]
-                out = sv.MaskAnnotator(opacity=0.4).annotate(out, shown)
-                out = sv.BoxAnnotator().annotate(out, shown)
-                out = sv.LabelAnnotator(
-                    text_scale=0.5, text_thickness=1
-                ).annotate(out, shown, labels=shown_labels)
+                out = annotate_detections(out, shown, shown_labels, cats)
             # Emphasize the selected detection on top (yellow if kept, else
             # orange so a rejected-but-selected box is still locatable).
             if sel_pos is not None:
                 x1, y1, x2, y2 = (int(v) for v in det.xyxy[sel_pos])
                 col = (0, 255, 255) if kept_mask[sel_pos] else (0, 165, 255)
                 cv2.rectangle(out, (x1, y1), (x2, y2), col, 4)
+
+            # Apply zoom by cropping the full-resolution annotated image
+            # around the selected detection (or image centre). The crop is
+            # what gets shipped to the browser; clicks are translated back
+            # to full-image coords below via (cw, ch, x_off, y_off) so
+            # hit-testing and SAM2 prompting stay resolution-agnostic.
+            H, W = out.shape[:2]
+            if zoom > 1.0:
+                cw = max(1, int(round(W / zoom)))
+                ch = max(1, int(round(H / zoom)))
+                if sel_pos is not None and sel_pos < len(det):
+                    x1, y1, x2, y2 = det.xyxy[sel_pos]
+                    cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
+                else:
+                    cx, cy = W // 2, H // 2
+                x_off = max(0, min(W - cw, cx - cw // 2))
+                y_off = max(0, min(H - ch, cy - ch // 2))
+                out = out[y_off:y_off + ch, x_off:x_off + cw]
+            else:
+                x_off, y_off, cw, ch = 0, 0, W, H
 
             rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
             # Ship a downscaled copy to the browser: the component base64-
@@ -475,8 +500,12 @@ def main():
                 and click != st.session_state.get(last_key)
             ):
                 st.session_state[last_key] = click
-                ox = int(click["x"] * image.shape[1] / click["width"])
-                oy = int(click["y"] * image.shape[0] / click["height"])
+                # click["width"] is the displayed crop's width; cw/ch are the
+                # crop's pixel size in full-image space, and (x_off, y_off)
+                # shifts back to absolute coords. Reduces to the original
+                # formula at zoom == 1.0 (x_off = 0, cw = image width).
+                ox = int(x_off + click["x"] * cw / click["width"])
+                oy = int(y_off + click["y"] * ch / click["height"])
                 if mode == "Add object":
                     sam, _device = load_sam(sam2_model)
                     mask = sam_mask_at_point(sam, image, ox, oy)
