@@ -4,7 +4,7 @@ import util.segmentation
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Auto-label images with Grounding DINO + SAM2."
+        description="Auto-label images with SAM 3."
     )
     parser.add_argument(
         "--config",
