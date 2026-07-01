@@ -42,6 +42,14 @@ ontology:
   "referee": "referee"
   "soccer ball": "ball"
   "soccer field": "field"
+
+# Optional: automated annotation verification (verify.py). All keys are
+# optional and default to the values shown below.
+verify:
+  model: claude-sonnet-5         # default: claude-sonnet-5
+  use_batch: true                # default: true (Batch API, ~50% cheaper; false = one request per frame)
+  max_image_width: 1280          # default: 1280 (overlay image sent to the model is downscaled to this width)
+  max_tokens: 1024               # default: 1024
 ```
 
 ## Usage
@@ -61,6 +69,22 @@ python -m util.render_overlays config.yaml
 ```
 
 Outputs `overlay_<filename>.jpg` files into `<dest_directory>/overlays/` with boxes, masks, and class labels drawn on each image.
+
+### Automated review
+
+An optional pass that uses Claude to do per-detection quality control (keep / reject / reclassify) before the human review UI, auto-resolving the confident majority of detections and flagging only genuinely uncertain ones for a human yes/no pass:
+
+```bash
+export ANTHROPIC_API_KEY=...
+python verify.py --config config.yaml
+```
+
+- `--limit N`: only verify the first N frames (smoke test).
+- `--sync`: use synchronous per-frame requests instead of the Batch API — useful for a quick smoke test without waiting on batch completion (pair with `--limit`).
+
+Verdicts are schema-constrained (structured outputs), so responses are guaranteed valid JSON with a `class` restricted to the actual ontology. At 100k standard-resolution frames, the default model + Batch API path costs roughly $300-450. Cost, model, and image size are configurable via the `verify:` block in `config.yaml` (see Configuration above).
+
+Writes `<dest_directory>/review_state.json` (pre-filled decisions; confidently-resolved frames pre-marked reviewed), `<dest_directory>/reviewed_annotations.json` (confident keeps/reclassifies only), and `<dest_directory>/verification_report.json` (counts, flag reasons, token usage). None of this modifies `annotations.json`. Frames the verifier flagged remain unreviewed with the verifier's tentative decision pre-applied, so opening the Review UI next (below) means only touching that flagged minority.
 
 ### Review UI
 
@@ -87,7 +111,7 @@ Progress autosaves to `<dest_directory>/review_state.json` on navigation, so clo
 
 Per-frame post-filter: only the highest-confidence ball detection is kept per image (structural constraint — soccer has one ball in play).
 
-The review UI additionally produces `reviewed_annotations.json` (the cleaned, kept-only subset for training) and `review_state.json` (per-annotation review progress, for resume — not a training artifact).
+The review UI additionally produces `reviewed_annotations.json` (the cleaned, kept-only subset for training) and `review_state.json` (per-annotation review progress, for resume — not a training artifact). Running `verify.py` first populates both of those (see Automated review above) plus `verification_report.json` (run summary — counts, flag reasons, token usage — not a training artifact).
 
 ## Notes
 

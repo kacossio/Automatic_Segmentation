@@ -14,6 +14,9 @@ streamlit>=1.30
 streamlit-image-coordinates>=0.1.6
 streamlit-shortcuts>=0.1.9  # optional keyboard nav; review.py degrades if absent
 
+# Automated annotation verification (verify.py)
+anthropic>=0.40
+
 # Install PyTorch with CUDA *before* running pip install -r requirements.txt.
 # Example (CUDA 12.4):
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
