@@ -1,6 +1,5 @@
-# Grounding DINO (via HF Transformers) + SAM2 stack
-transformers>=4.49
-sam-2 @ git+https://github.com/facebookresearch/sam2.git
+# SAM 3 (via HF Transformers) stack
+transformers>=4.49  # must include SAM 3 (Sam3Model / Sam3Processor)
 supervision>=0.22.0
 pycocotools>=2.0
 
@@ -21,7 +20,5 @@ anthropic>=0.40
 # Example (CUDA 12.4):
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 #
-# On first run, both Grounding DINO and SAM2 weights auto-download to
-# ~/.cache/huggingface/. Models are configurable in config.yaml via
-# dino_model (default IDEA-Research/grounding-dino-tiny) and
-# sam2_model (default facebook/sam2-hiera-large).
+# On first run, SAM 3 weights auto-download to ~/.cache/huggingface/. The
+# model is configurable in config.yaml via sam3_model (default facebook/sam3).
