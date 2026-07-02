@@ -1,6 +1,6 @@
 # Automatic_Segmentation
 
-Text-prompted image segmentation pipeline using HuggingFace Grounding DINO + Meta SAM2. Walks a folder of images, runs zero-shot detection from a user-defined ontology, generates instance masks with SAM2, and writes everything to COCO JSON suitable for downstream training.
+Text-prompted image segmentation pipeline using Meta SAM 3. Walks a folder of images, runs promptable concept segmentation from a user-defined ontology — one pass per prompt, text straight to instance masks — and writes everything to COCO JSON suitable for downstream training.
 
 Built for soccer footage auto-labeling (`player`, `goalkeeper`, `referee`, `ball`, `field`), but the ontology is fully configurable for any domain.
 
@@ -19,6 +19,8 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 pip install -r requirements.txt
 ```
 
+SAM 3 needs a `transformers` build that ships `Sam3Model` / `Sam3Processor`; install transformers from source if your pinned release predates SAM 3 support.
+
 Model weights download automatically on first run to `~/.cache/huggingface/` — no manual download step.
 
 ## Configuration
@@ -29,17 +31,28 @@ Create a `config.yaml`:
 source_directory: data                  # folder of input .jpg/.jpeg/.png images (non-recursive)
 dest_directory: data/output             # where annotations.json is written
 
-# Optional model + threshold overrides
-dino_model: IDEA-Research/grounding-dino-base   # default: grounding-dino-tiny
-sam2_model: facebook/sam2-hiera-large           # default: same
-box_threshold: 0.25                              # default: 0.35
-text_threshold: 0.20                             # default: 0.25
+sam3_model: facebook/sam3               # SAM 3 checkpoint
+sam3_score_threshold: 0.5               # detection score floor (post_process threshold)
+sam3_mask_threshold: 0.5                # mask binarization threshold
+
+# Per-class confidence floor applied on top of sam3_score_threshold.
+# Classes not listed fall back to sam3_score_threshold.
+class_thresholds:
+  player: 0.30
+  goalkeeper: 0.30
+  referee: 0.15
+  ball: 0.10
+  field: 0.25
+
+# Enforce single-instance rules per image (highest-confidence ball + on-field
+# referee). Off by default — otherwise the call is left to the reviewer.
+apply_domain_filters: true
 
 # Map text prompts -> class labels (the COCO category names)
 ontology:
   "soccer player": "player"
   "goalkeeper": "goalkeeper"
-  "referee": "referee"
+  "soccer referee": "referee"
   "soccer ball": "ball"
   "soccer field": "field"
 
@@ -51,6 +64,8 @@ verify:
   max_image_width: 1280          # default: 1280 (overlay image sent to the model is downscaled to this width)
   max_tokens: 1024               # default: 1024
 ```
+
+Each ontology prompt is run as a separate SAM 3 concept query and its detections are tagged with that prompt's class directly, so the COCO categories are exactly the ontology values.
 
 ## Usage
 
@@ -107,15 +122,15 @@ Progress autosaves to `<dest_directory>/review_state.json` on navigation, so clo
 `annotations.json` follows COCO format:
 - `categories`: numbered classes from the ontology (values, not prompts)
 - `images`: one entry per source image with width/height
-- `annotations`: one per detection — `bbox` (xywh), `area`, `segmentation` (compressed RLE mask), `category_id`, and `score` (Grounding DINO detection confidence in `[0, 1]`; `-1.0` if it could not be aligned)
+- `annotations`: one per detection — `bbox` (xywh), `area`, `segmentation` (compressed RLE mask), `category_id`, and `score` (SAM 3 detection confidence in `[0, 1]`)
 
-Per-frame post-filter: only the highest-confidence ball detection is kept per image (structural constraint — soccer has one ball in play).
+When `apply_domain_filters: true`, a per-frame post-filter enforces single-instance constraints — only the highest-confidence ball and the single on-field referee are kept per image. It is off by default, deferring that call to review.
 
 The review UI additionally produces `reviewed_annotations.json` (the cleaned, kept-only subset for training) and `review_state.json` (per-annotation review progress, for resume — not a training artifact). Running `verify.py` first populates both of those (see Automated review above) plus `verification_report.json` (run summary — counts, flag reasons, token usage — not a training artifact).
 
 ## Notes
 
-- First run downloads ~1.5 GB of model weights into the HuggingFace cache. Subsequent runs are fast.
-- Inference speed: ~2 it/s on an RTX 3090 with `grounding-dino-base` + `sam2-hiera-large`. `grounding-dino-tiny` is ~3x faster but has noticeably lower recall — at the default `box_threshold` it can miss small/numerous classes (e.g. players) entirely. `grounding-dino-base` with `box_threshold: 0.25` is recommended for soccer footage.
-- Prompt → class mapping is word-level and tolerant of how Grounding DINO returns labels: multi-word prompts (`"soccer player"`) still resolve when the model returns only a fragment (`"player"`), while labels that are ambiguous across classes (e.g. bare `"soccer"`, shared by player/ball/field) are dropped rather than misassigned.
+- First run downloads the SAM 3 weights into the HuggingFace cache. Subsequent runs are fast.
+- The pipeline issues one SAM 3 concept query per ontology prompt and concatenates the per-prompt detections; each detection keeps its prompt's class, so overlapping detections from different prompts (e.g. a player also grounded by `soccer referee`) are all retained for the reviewer rather than deduped away.
+- Recall-first by design: `sam3_score_threshold` is a low global floor and `class_thresholds` restores precision per class, keeping rare/ambiguous classes (referee, ball) for human review rather than dropping them outright.
 - This pipeline is intentionally a **labeler**, not a production detector. Output is meant to be reviewed/cleaned before training a custom downstream model.

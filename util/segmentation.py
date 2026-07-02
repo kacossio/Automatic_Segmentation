@@ -1,13 +1,15 @@
 """
-Text-prompted image segmentation using HF Grounding DINO + SAM2.
-Produces COCO JSON output from per-image masks.
+Text-prompted image segmentation using Meta SAM 3.
+
+SAM 3 promptable concept segmentation goes from text prompt straight to
+instance masks in one model — one call per ontology prompt. Produces COCO
+JSON output from per-image masks.
 """
 import json
 import os
-import re
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import supervision as sv
@@ -15,16 +17,10 @@ import torch
 import yaml
 from PIL import Image
 from pycocotools import mask as coco_mask
-from sam2.sam2_image_predictor import SAM2ImagePredictor
 from tqdm import tqdm
-from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+from transformers import Sam3Model, Sam3Processor
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
-
-# Boxes Grounding DINO finds but cannot be unambiguously mapped to an ontology
-# class are kept under this class for the human reviewer to reclassify or
-# reject, rather than being silently dropped (which caps recall).
-UNKNOWN_CLASS = "unknown"
 
 
 class Segmenter:
@@ -37,36 +33,26 @@ class Segmenter:
         self.dest_directory: str = cfg["dest_directory"]
         self.ontology_map: Dict[str, str] = cfg["ontology"]
 
-        self.dino_model_id: str = cfg.get("dino_model", "IDEA-Research/grounding-dino-tiny")
-        self.sam2_model: str = cfg.get("sam2_model", "facebook/sam2-hiera-large")
-        # Recall-first global floor: keep almost everything from DINO, then
-        # recover precision per class and via human review.
-        self.box_threshold: float = float(cfg.get("box_threshold", 0.15))
-        self.text_threshold: float = float(cfg.get("text_threshold", 0.15))
-        # Per-class confidence floor applied *after* label->class mapping.
-        # Classes absent here fall back to box_threshold.
+        self.sam3_model_id: str = cfg.get("sam3_model", "facebook/sam3")
+        # Published defaults from the SAM 3 model card.
+        self.sam3_score_threshold: float = float(cfg.get("sam3_score_threshold", 0.5))
+        self.sam3_mask_threshold: float = float(cfg.get("sam3_mask_threshold", 0.5))
+        # Per-class confidence floor applied on top of sam3_score_threshold.
+        # Classes absent here fall back to sam3_score_threshold.
         self.class_thresholds: Dict[str, float] = {
             str(k): float(v) for k, v in cfg.get("class_thresholds", {}).items()
         }
-        # Class-agnostic NMS IoU on DINO boxes before SAM2.
-        self.nms_iou: float = float(cfg.get("nms_iou", 0.80))
         # When false (default) nothing is dropped before human review: the
         # "one ball in play" rule becomes the reviewer's decision.
         self.apply_domain_filters: bool = bool(cfg.get("apply_domain_filters", False))
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        self.prompts: List[str] = [p.lower().strip() for p in self.ontology_map.keys()]
         self.classes: List[str] = list(dict.fromkeys(self.ontology_map.values()))
-        # Map normalized prompt -> class id. Built before UNKNOWN is appended so
-        # these indices stay valid.
+        # Map normalized prompt -> class id.
         self.prompt_to_class_id: Dict[str, int] = {
             p.lower().strip(): self.classes.index(c) for p, c in self.ontology_map.items()
         }
-        # UNKNOWN appended last so the indices above are unchanged.
-        if UNKNOWN_CLASS not in self.classes:
-            self.classes.append(UNKNOWN_CLASS)
-        self.unknown_class_id: int = self.classes.index(UNKNOWN_CLASS)
 
         # (width, height) captured during predict_image so _write_coco never
         # re-reads the source images just to learn their size.
@@ -79,150 +65,75 @@ class Segmenter:
         os.makedirs(self.dest_directory, exist_ok=True)
 
     def load_models(self):
-        processor = AutoProcessor.from_pretrained(self.dino_model_id)
-        dino = (
-            AutoModelForZeroShotObjectDetection.from_pretrained(self.dino_model_id)
+        processor = Sam3Processor.from_pretrained(self.sam3_model_id)
+        model = (
+            Sam3Model.from_pretrained(self.sam3_model_id)
             .to(self.device)
             .eval()
         )
-        sam = SAM2ImagePredictor.from_pretrained(self.sam2_model, device=self.device)
-        return processor, dino, sam
+        return processor, model
 
-    def _label_to_class_id(self, label: str) -> Optional[int]:
-        """Map a Grounding DINO text label to an ontology class id.
+    def predict_image(self, image_path: str, processor, model) -> sv.Detections:
+        det = self._predict_sam3(image_path, processor, model)
+        return self._apply_domain_filters(det) if self.apply_domain_filters else det
 
-        Grounding DINO grounds boxes to *token spans*, so for a multi-word
-        prompt it usually returns a sub-phrase (e.g. "player" for the prompt
-        "soccer player") and drops words that are ambiguous across prompts
-        (e.g. "soccer", which is shared by player/ball/field). Matching must
-        therefore be word-level and bidirectional, not full-phrase exact.
+    def _predict_sam3(self, image_path: str, processor, model) -> sv.Detections:
+        """SAM 3 promptable concept segmentation, one call per ontology prompt.
+
+        Mirrors the model card's documented usage:
+        ``processor(images=pil, text=prompt) -> model(**inputs) ->
+        post_process_instance_segmentation``. No vision-feature caching, no
+        bf16 autocast, no prefetch -- the model card pattern was already fast
+        on this dataset, and extra plumbing tended to make it slower.
         """
-        label = label.lower().strip()
-        if not label:
-            return None
-
-        # 1. Exact phrase match.
-        if label in self.prompt_to_class_id:
-            return self.prompt_to_class_id[label]
-
-        label_words = set(re.findall(r"[a-z]+", label))
-        if not label_words:
-            return None
-
-        # 2. Word-overlap scoring. The best prompt is the one sharing the most
-        #    words with the label; a tie between *different* classes means the
-        #    label is ambiguous (e.g. bare "soccer") -> drop rather than guess.
-        def words_match(a: str, b: str) -> bool:
-            # Exact, or substring-either-direction for plural / affixed
-            # variants ("players" vs "player"). Length guard avoids noise
-            # like matching "a" inside "ball".
-            if a == b:
-                return True
-            return min(len(a), len(b)) >= 4 and (a in b or b in a)
-
-        best_cid: Optional[int] = None
-        best_score = 0
-        ambiguous = False
-        for p, cid in self.prompt_to_class_id.items():
-            prompt_words = set(re.findall(r"[a-z]+", p))
-            score = sum(
-                any(words_match(lw, pw) for pw in prompt_words)
-                for lw in label_words
-            )
-            if score > best_score:
-                best_score, best_cid, ambiguous = score, cid, False
-            elif score == best_score and score > 0 and cid != best_cid:
-                ambiguous = True
-
-        if best_score == 0 or ambiguous:
-            return None
-        return best_cid
-
-    def predict_image(self, image_path: str, processor, dino, sam) -> sv.Detections:
         pil_image = Image.open(image_path).convert("RGB")
         w, h = pil_image.size
         self._image_wh[image_path] = (w, h)
 
-        inputs = processor(
-            images=pil_image,
-            text=[self.prompts],
-            return_tensors="pt",
-        ).to(self.device)
+        all_boxes: List[np.ndarray] = []
+        all_scores: List[np.ndarray] = []
+        all_masks: List[np.ndarray] = []
+        all_class_ids: List[np.ndarray] = []
 
-        with torch.inference_mode():
-            outputs = dino(**inputs)
+        for prompt, class_id in self.prompt_to_class_id.items():
+            # Per-class confidence floor on top of sam3_score_threshold; classes
+            # absent from class_thresholds fall back to the global SAM3 floor.
+            floor = self.class_thresholds.get(
+                self.classes[class_id], self.sam3_score_threshold
+            )
+            inputs = processor(
+                images=pil_image, text=prompt, return_tensors="pt"
+            ).to(self.device)
+            with torch.inference_mode():
+                outputs = model(**inputs)
+            results = processor.post_process_instance_segmentation(
+                outputs,
+                threshold=floor,
+                mask_threshold=self.sam3_mask_threshold,
+                target_sizes=[(h, w)],
+            )[0]
+            if len(results["boxes"]) == 0:
+                continue
+            all_boxes.append(results["boxes"].cpu().numpy())
+            all_scores.append(results["scores"].cpu().numpy())
+            all_masks.append(results["masks"].cpu().numpy().astype(bool))
+            all_class_ids.append(np.full(len(results["boxes"]), class_id, dtype=int))
 
-        results = processor.post_process_grounded_object_detection(
-            outputs,
-            threshold=self.box_threshold,
-            text_threshold=self.text_threshold,
-            target_sizes=[(h, w)],
-            text_labels=[self.prompts],
-        )[0]
-
-        boxes = results["boxes"].cpu().numpy()  # xyxy absolute
-        scores = results["scores"].cpu().numpy()
-        text_labels = results["text_labels"]
-
-        if len(boxes) == 0:
+        if not all_boxes:
             return sv.Detections.empty()
 
-        # Label -> class. Unmappable / ambiguous boxes are *kept* as UNKNOWN
-        # (the reviewer reclassifies or rejects them) rather than dropped, so
-        # recall is not capped by DINO's grounding ambiguity.
-        class_ids = np.array(
-            [
-                cid if (cid := self._label_to_class_id(lbl)) is not None
-                else self.unknown_class_id
-                for lbl in text_labels
-            ],
-            dtype=int,
+        return sv.Detections(
+            xyxy=np.concatenate(all_boxes, axis=0).astype(float),
+            class_id=np.concatenate(all_class_ids, axis=0),
+            confidence=np.concatenate(all_scores, axis=0).astype(float),
+            mask=np.concatenate(all_masks, axis=0),
         )
-
-        # Per-class confidence floor (the global box_threshold is recall-first
-        # low; this restores precision per class).
-        floors = np.array(
-            [
-                self.class_thresholds.get(self.classes[c], self.box_threshold)
-                for c in class_ids
-            ],
-            dtype=float,
-        )
-        keep = scores >= floors
-        boxes, scores, class_ids = boxes[keep], scores[keep], class_ids[keep]
-        if len(boxes) == 0:
-            return sv.Detections.empty()
-
-        # Class-agnostic NMS drops near-duplicate boxes (e.g. "soccer player"
-        # vs "goalkeeper" on the same person) before paying SAM2 cost. High IoU
-        # so a small ball box inside a large player box is not merged.
-        det = sv.Detections(
-            xyxy=boxes,
-            class_id=class_ids,
-            confidence=scores,
-        ).with_nms(threshold=self.nms_iou, class_agnostic=True)
-        if len(det) == 0:
-            return sv.Detections.empty()
-
-        image_rgb = np.asarray(pil_image)
-        with torch.inference_mode(), torch.autocast(self.device, dtype=torch.bfloat16):
-            sam.set_image(image_rgb)
-            masks_out: List[np.ndarray] = []
-            for box in det.xyxy:
-                # multimask_output=True returns 3 candidate masks at different
-                # granularities; pick the highest-scoring (tighter on thin
-                # limbs / occlusions). With False this argmax was dead code.
-                masks, mask_scores, _ = sam.predict(box=box, multimask_output=True)
-                masks_out.append(masks[int(np.argmax(mask_scores))].astype(bool))
-
-        det.mask = np.stack(masks_out, axis=0)
-        return self._apply_domain_filters(det) if self.apply_domain_filters else det
 
     def _apply_domain_filters(self, det: sv.Detections) -> sv.Detections:
         """Soccer-specific post-filter for single-instance classes.
 
-        - Ball: reject player-shaped boxes (DINO often grounds "soccer ball"
-          onto the whole ball-carrying player), then keep only the
+        - Ball: reject player-shaped boxes (SAM3 sometimes grounds "soccer
+          ball" onto the whole ball-carrying player), then keep only the
           highest-confidence remaining detection (one ball in play). If none
           are ball-shaped, keep none rather than a player.
         - Referee: prefer referees standing inside the detected field (feet =
@@ -241,12 +152,12 @@ class Segmenter:
         if ball_id is not None:
             idx = np.where(det.class_id == ball_id)[0]
             if len(idx) > 0:
-                # A real ball box is small and roughly square. DINO frequently
-                # grounds the "soccer ball" prompt onto the whole player who
-                # has the ball, producing a tall, large box. Reject those
-                # before the single-ball dedup so the kept ball is never a
+                # A real ball box is small and roughly square. The model
+                # sometimes grounds the "soccer ball" prompt onto the whole
+                # player who has the ball, producing a tall, large box. Reject
+                # those before the single-ball dedup so the kept ball is never a
                 # player; if nothing is ball-shaped, keep no ball this frame
-                # (the reviewer can click-add the real one).
+                # (the reviewer can flag the miss).
                 frame_area = None
                 if det.mask is not None:
                     mh, mw = det.mask.shape[1:]
@@ -306,11 +217,10 @@ class Segmenter:
         """One image's sv.Detections -> COCO annotation dicts (no id/image_id).
 
         Masks are compressed-RLE encoded (pycocotools), the same lossless
-        encoding review.py emits for human-added masks and that
-        render_overlays / review.py already decode -- avoiding supervision's
-        slower, lossy polygon approximation. Each detection's confidence is
-        attached inline as ``score`` (bound to its detection at creation, so
-        no fragile post-hoc index matching).
+        encoding review.py emits and that render_overlays / review.py already
+        decode -- avoiding supervision's slower, lossy polygon approximation.
+        Each detection's confidence is attached inline as ``score`` (bound to
+        its detection at creation, so no fragile post-hoc index matching).
         """
         if det.confidence is None or len(det) == 0:
             return []
@@ -417,8 +327,8 @@ class Segmenter:
         return coco_path
 
     def run(self):
-        print(f"Loading Grounding DINO ({self.dino_model_id}) + SAM2 ({self.sam2_model}) on {self.device}...")
-        processor, dino, sam = self.load_models()
+        print(f"Loading SAM 3 ({self.sam3_model_id}) on {self.device}...")
+        processor, model = self.load_models()
 
         image_paths = self._collect_images()
         if not image_paths:
@@ -430,7 +340,7 @@ class Segmenter:
         failures: List[str] = []
         for n, path in enumerate(tqdm(image_paths, desc="Segmenting"), start=1):
             try:
-                annotations[path] = self.predict_image(path, processor, dino, sam)
+                annotations[path] = self.predict_image(path, processor, model)
             except Exception as e:  # one bad image must not abort the batch
                 annotations[path] = sv.Detections.empty()
                 failures.append(path)
