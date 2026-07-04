@@ -63,7 +63,7 @@ def load_coco(config_path: str, coco_mtime: float):
     return cfg, str(src), str(dest), coco, cats, images, per_img
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False, max_entries=16)
 def load_frame(img_path: str, _anns, _cats, cache_key: str):
     """Read an image and decode all its detections once (cached per frame).
 
@@ -74,7 +74,9 @@ def load_frame(img_path: str, _anns, _cats, cache_key: str):
     same objects instead of pickling/unpickling the image + stacked masks on
     every rerun. Safe because callers never mutate the cached objects: the
     image is ``.copy()``- d before drawing and ``det`` is sliced into a new
-    ``Detections`` before any field is reassigned.
+    ``Detections`` before any field is reassigned. ``max_entries`` bounds the
+    cache so a long review session doesn't accumulate every visited frame's
+    image + masks in memory.
     """
     img = cv2.imread(img_path)
     if img is None:
