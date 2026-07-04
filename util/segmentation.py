@@ -9,7 +9,7 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import supervision as sv
@@ -21,6 +21,109 @@ from tqdm import tqdm
 from transformers import Sam3Model, Sam3Processor
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
+
+# Classes that can describe the same physical person. SAM3 runs one text
+# prompt per class, so a single person is often boxed twice under two of
+# these (most commonly "player" + "referee", also "player" + "goalkeeper").
+PERSON_CLASSES = ("player", "goalkeeper", "referee")
+# IoU above which two person-class boxes are treated as the same object
+# rather than two distinct, overlapping people. Matches verify.py's
+# DUPLICATE_IOU so the deterministic pass here and the LLM fallback there
+# agree on what counts as a duplicate.
+CROSS_CLASS_DUP_IOU = 0.85
+
+
+def _xyxy_iou(a: np.ndarray, b: np.ndarray) -> float:
+    """IoU of two xyxy boxes."""
+    x1, y1 = max(a[0], b[0]), max(a[1], b[1])
+    x2, y2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _feet_on_field(box: np.ndarray, field_mask: np.ndarray) -> bool:
+    """True if the ground around an xyxy box's feet falls inside the field
+    mask. Shared by resolve_person_duplicates and the referee singleton
+    filter in _apply_domain_filters.
+
+    Samples a ring of points around (not under) the box's bottom edge,
+    pushed outward by a margin, rather than the single bottom-center pixel.
+    The field mask is a segmentation of visible grass, so it has a
+    person-shaped gap under every occluding body -- the bottom-center pixel
+    of a tightly-fit box is the person's own foot/shoe, which is never
+    "field", regardless of whether they're standing on the pitch or not.
+    Sampled this checked false for a referee standing in the dead centre of
+    open pitch grass before the ring fix. True if any ring point is field.
+    """
+    x1, y1, x2, y2 = box
+    h, w = field_mask.shape
+    bw = max(x2 - x1, 1.0)
+    margin = max(bw * 0.4, 8.0)
+    xs = (x1 - margin, (x1 + x2) / 2.0, x2 + margin)
+    ys = (y2 - 2.0, y2 + margin)
+    for yy in ys:
+        for xx in xs:
+            fx = min(max(int(round(xx)), 0), w - 1)
+            fy = min(max(int(round(yy)), 0), h - 1)
+            if field_mask[fy, fx]:
+                return True
+    return False
+
+
+def resolve_person_duplicates(
+    xyxy: np.ndarray,
+    class_names: List[str],
+    confidence: np.ndarray,
+    field_mask: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Boolean keep-mask resolving same-object cross-class person duplicates.
+
+    When two person-class boxes (player/goalkeeper/referee) overlap above
+    CROSS_CLASS_DUP_IOU, they're almost always the same person caught by two
+    of the per-class text prompts, not two people. Resolved structurally
+    rather than by confidence: class_thresholds sets very different floors
+    per class on purpose (referee: 0.15 vs player: 0.30, to keep rare/
+    low-confidence referees for review), so a referee box legitimately
+    scoring lower than the player box on the very same person is expected,
+    not a sign the player label is right. The specific class (referee/
+    goalkeeper) wins over the generic "player" class on the same object --
+    unless a field mask is available and that specific-class box's feet
+    fall off the pitch, in which case an off-field "referee"/"goalkeeper" is
+    as likely to be a misfire (bench staff, fourth official) as a real one,
+    so it falls back to confidence instead of automatically winning.
+    Referee-vs-goalkeeper (no class-name signal either way) always falls
+    back to confidence. Shared by Segmenter._apply_domain_filters
+    (per-frame, at label time) and dedup_annotations.py (one-off pass over
+    an existing annotations.json), so both apply the exact same rule.
+    """
+    keep = np.ones(len(class_names), dtype=bool)
+    person_idx = [i for i, n in enumerate(class_names) if n in PERSON_CLASSES]
+    for a in range(len(person_idx)):
+        i = person_idx[a]
+        for b in range(a + 1, len(person_idx)):
+            j = person_idx[b]
+            if not keep[i] or not keep[j]:
+                continue
+            if _xyxy_iou(xyxy[i], xyxy[j]) < CROSS_CLASS_DUP_IOU:
+                continue
+            name_i, name_j = class_names[i], class_names[j]
+            player, other = None, None
+            if name_i == "player" and name_j != "player":
+                player, other = i, j
+            elif name_j == "player" and name_i != "player":
+                player, other = j, i
+
+            if player is not None and (
+                field_mask is None or _feet_on_field(xyxy[other], field_mask)
+            ):
+                keep[player] = False
+            else:
+                loser = i if confidence[i] < confidence[j] else j
+                keep[loser] = False
+    return keep
 
 
 class Segmenter:
@@ -37,8 +140,9 @@ class Segmenter:
         # Published defaults from the SAM 3 model card.
         self.sam3_score_threshold: float = float(cfg.get("sam3_score_threshold", 0.5))
         self.sam3_mask_threshold: float = float(cfg.get("sam3_mask_threshold", 0.5))
-        # Per-class confidence floor applied on top of sam3_score_threshold.
-        # Classes absent here fall back to sam3_score_threshold.
+        # Per-class confidence floor. A class listed here REPLACES
+        # sam3_score_threshold for that class (it does not stack on top of it);
+        # only classes absent from this map fall back to the global threshold.
         self.class_thresholds: Dict[str, float] = {
             str(k): float(v) for k, v in cfg.get("class_thresholds", {}).items()
         }
@@ -58,9 +162,11 @@ class Segmenter:
         # re-reads the source images just to learn their size.
         self._image_wh: Dict[str, Tuple[int, int]] = {}
         # image path -> already-built COCO annotation dicts (sans id/image_id).
-        # Each mask is RLE-encoded exactly once; checkpoint writes reuse this
-        # instead of re-encoding every image processed so far (was O(N^2)).
-        self._coco_cache: Dict[str, List[dict]] = {}
+        # This is the ONLY per-frame state kept across the run: detections are
+        # RLE-encoded into these dicts immediately after prediction and the
+        # sv.Detections (with its full-resolution boolean masks, ~MBs per
+        # detection) is dropped, so memory stays flat over 100k-frame runs.
+        self._frames: Dict[str, List[dict]] = {}
 
         os.makedirs(self.dest_directory, exist_ok=True)
 
@@ -132,6 +238,17 @@ class Segmenter:
     def _apply_domain_filters(self, det: sv.Detections) -> sv.Detections:
         """Soccer-specific post-filter for single-instance classes.
 
+        - Cross-class person duplicates: when two person-class boxes (player/
+          goalkeeper/referee) overlap heavily, they're almost always the same
+          person caught by two of the per-class text prompts, not two people.
+          Resolved structurally rather than by confidence: class_thresholds
+          sets very different floors per class on purpose (referee: 0.15 vs
+          player: 0.30, to keep rare/low-confidence referees for review), so
+          a referee box legitimately scoring lower than the player box on the
+          very same person is expected, not a sign the player label is right.
+          The specific class (referee/goalkeeper) wins over the generic
+          "player" class on the same object, unless it's off the detected
+          field (see resolve_person_duplicates' docstring).
         - Ball: reject player-shaped boxes (SAM3 sometimes grounds "soccer
           ball" onto the whole ball-carrying player), then keep only the
           highest-confidence remaining detection (one ball in play). If none
@@ -146,7 +263,18 @@ class Segmenter:
             return det
 
         cls_index = {name: i for i, name in enumerate(self.classes)}
-        keep = np.ones(len(det), dtype=bool)
+
+        field_mask = None
+        field_id = cls_index.get("field")
+        if field_id is not None and det.mask is not None:
+            field_idx = np.where(det.class_id == field_id)[0]
+            if len(field_idx) > 0:
+                field_mask = np.any(det.mask[field_idx], axis=0)
+
+        class_names = [self.classes[c] for c in det.class_id]
+        keep = resolve_person_duplicates(
+            det.xyxy, class_names, det.confidence, field_mask
+        )
 
         ball_id = cls_index.get("ball")
         if ball_id is not None:
@@ -185,21 +313,10 @@ class Segmenter:
             idx = np.where(det.class_id == ref_id)[0]
             if len(idx) > 1:
                 candidates = idx
-                field_id = cls_index.get("field")
-                if field_id is not None and det.mask is not None:
-                    field_idx = np.where(det.class_id == field_id)[0]
-                    if len(field_idx) > 0:
-                        field_mask = np.any(det.mask[field_idx], axis=0)
-                        h, w = field_mask.shape
-                        on_field = []
-                        for i in idx:
-                            x1, _, x2, y2 = det.xyxy[i]
-                            fx = min(max(int(round((x1 + x2) / 2)), 0), w - 1)
-                            fy = min(max(int(round(y2)), 0), h - 1)
-                            if field_mask[fy, fx]:
-                                on_field.append(i)
-                        if on_field:
-                            candidates = np.array(on_field)
+                if field_mask is not None:
+                    on_field = [i for i in idx if _feet_on_field(det.xyxy[i], field_mask)]
+                    if on_field:
+                        candidates = np.array(on_field)
                 best = candidates[int(np.argmax(det.confidence[candidates]))]
                 keep[idx] = False
                 keep[best] = True
@@ -247,26 +364,77 @@ class Segmenter:
     def _image_size(self, path: str) -> Tuple[int, int]:
         """(width, height) for an image, preferring the size captured during
         prediction; falls back to a header-only read for failed/empty images
-        (PIL does not decode pixels for ``.size``)."""
+        (PIL does not decode pixels for ``.size``). An unreadable image (the
+        usual reason its prediction failed) records (0, 0) rather than
+        aborting the run a second time."""
         wh = self._image_wh.get(path)
         if wh is not None:
             return wh
-        with Image.open(path) as im:
-            wh = im.size
+        try:
+            with Image.open(path) as im:
+                wh = im.size
+        except Exception:
+            wh = (0, 0)
         self._image_wh[path] = wh
         return wh
 
+    @property
+    def _partial_path(self) -> Path:
+        """Append-only per-frame checkpoint (one JSON line per frame)."""
+        return Path(self.dest_directory) / "annotations.partial.jsonl"
+
+    def _load_partial(self) -> int:
+        """Resume state from annotations.partial.jsonl into self._frames.
+
+        Returns the number of frames loaded. Malformed trailing lines (a run
+        killed mid-write) are skipped so a partial last line never blocks
+        resuming. Delete the file to force a full relabel.
+        """
+        if not self._partial_path.exists():
+            return 0
+        loaded = 0
+        with open(self._partial_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # truncated final line from a killed run
+                path = rec["path"]
+                self._frames[path] = rec["annotations"]
+                self._image_wh[path] = (rec["width"], rec["height"])
+                loaded += 1
+        return loaded
+
+    def _append_partial(self, f, path: str, anns: List[dict]):
+        w, h = self._image_size(path)
+        f.write(
+            json.dumps(
+                {
+                    "path": path,
+                    "file_name": Path(path).name,
+                    "width": w,
+                    "height": h,
+                    "annotations": anns,
+                },
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        f.flush()
+
     def _write_coco(
-        self, annotations: Dict[str, sv.Detections], progress: bool = True
+        self, frames: Dict[str, List[dict]], progress: bool = True
     ) -> Path:
-        """Build COCO from the detections collected so far and write
+        """Build COCO from the per-frame annotation dicts and write
         annotations.json directly (no supervision DetectionDataset / image
         re-read / double serialization).
 
-        Safe to call repeatedly (checkpointing): only the images already
-        processed are included, so a killed run keeps valid partial output.
-        Per-image annotation dicts are cached so each mask is RLE-encoded only
-        once across the whole run.
+        Called once at the end of a run; mid-run durability comes from the
+        per-frame JSONL checkpoint (annotations.partial.jsonl), so a killed
+        run resumes instead of rewriting the whole JSON every N frames.
         """
         licenses = [
             {
@@ -285,16 +453,10 @@ class Segmenter:
         coco_annotations: List[dict] = []
         image_id, annotation_id = 1, 1
 
-        items = annotations.items()
+        items = sorted(frames.items())
         if progress:
-            items = tqdm(
-                list(items), desc="Writing COCO", leave=False, unit="img"
-            )
-        for path, det in items:
-            anns = self._coco_cache.get(path)
-            if anns is None:
-                anns = self._detections_to_coco(det)
-                self._coco_cache[path] = anns
+            items = tqdm(items, desc="Writing COCO", leave=False, unit="img")
+        for path, anns in items:
             w, h = self._image_size(path)
             coco_images.append(
                 {
@@ -327,28 +489,39 @@ class Segmenter:
         return coco_path
 
     def run(self):
-        print(f"Loading SAM 3 ({self.sam3_model_id}) on {self.device}...")
-        processor, model = self.load_models()
-
         image_paths = self._collect_images()
         if not image_paths:
             raise FileNotFoundError(f"No images found in {self.source_directory}")
         print(f"Found {len(image_paths)} image(s) in '{self.source_directory}'.")
 
-        checkpoint_every = 25
-        annotations: Dict[str, sv.Detections] = {}
-        failures: List[str] = []
-        for n, path in enumerate(tqdm(image_paths, desc="Segmenting"), start=1):
-            try:
-                annotations[path] = self.predict_image(path, processor, model)
-            except Exception as e:  # one bad image must not abort the batch
-                annotations[path] = sv.Detections.empty()
-                failures.append(path)
-                tqdm.write(f"FAILED {path}: {type(e).__name__}: {e}")
-            if n % checkpoint_every == 0:
-                self._write_coco(annotations, progress=False)
+        resumed = self._load_partial()
+        if resumed:
+            print(
+                f"Resuming: {resumed} frame(s) already in {self._partial_path} "
+                "will be skipped (delete the file to relabel from scratch)."
+            )
+        todo = [p for p in image_paths if p not in self._frames]
 
-        coco_path = self._write_coco(annotations)
+        failures: List[str] = []
+        if todo:
+            print(f"Loading SAM 3 ({self.sam3_model_id}) on {self.device}...")
+            processor, model = self.load_models()
+
+            with open(self._partial_path, "a") as partial:
+                for path in tqdm(todo, desc="Segmenting"):
+                    try:
+                        det = self.predict_image(path, processor, model)
+                        # RLE-encode now and drop the Detections (and its
+                        # full-res masks) so memory stays flat over the run.
+                        anns = self._detections_to_coco(det)
+                    except Exception as e:  # one bad image must not abort the batch
+                        anns = []
+                        failures.append(path)
+                        tqdm.write(f"FAILED {path}: {type(e).__name__}: {e}")
+                    self._frames[path] = anns
+                    self._append_partial(partial, path, anns)
+
+        coco_path = self._write_coco(self._frames)
         print(f"Done. COCO annotations written to: {coco_path}")
         if failures:
             print(f"\n{len(failures)} image(s) failed and were written empty:")

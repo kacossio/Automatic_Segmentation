@@ -35,8 +35,9 @@ sam3_model: facebook/sam3               # SAM 3 checkpoint
 sam3_score_threshold: 0.5               # detection score floor (post_process threshold)
 sam3_mask_threshold: 0.5                # mask binarization threshold
 
-# Per-class confidence floor applied on top of sam3_score_threshold.
-# Classes not listed fall back to sam3_score_threshold.
+# Per-class confidence floor. A listed class REPLACES sam3_score_threshold
+# (it does not stack on top of it); only classes not listed fall back to
+# the global threshold.
 class_thresholds:
   player: 0.30
   goalkeeper: 0.30
@@ -76,6 +77,8 @@ python run.py
 ```
 
 This writes `<dest_directory>/annotations.json` in COCO format (categories, images, annotations with `bbox`, `area`, RLE `segmentation`).
+
+Progress is checkpointed per frame to `<dest_directory>/annotations.partial.jsonl` (one JSON line per completed image). If a run is killed, re-running `python run.py` resumes from the checkpoint and only labels the remaining frames; delete the `.jsonl` file to force a full relabel. The final `annotations.json` is assembled once at the end of the run.
 
 To render static visual overlays of the annotations:
 
