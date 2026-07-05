@@ -34,6 +34,7 @@ dest_directory: data/output             # where annotations.json is written
 sam3_model: facebook/sam3               # SAM 3 checkpoint
 sam3_score_threshold: 0.5               # detection score floor (post_process threshold)
 sam3_mask_threshold: 0.5                # mask binarization threshold
+sam3_batch_size: 4                      # frames per forward pass; raise only if VRAM allows (see config.yaml)
 
 # Per-class confidence floor. A listed class REPLACES sam3_score_threshold
 # (it does not stack on top of it); only classes not listed fall back to
@@ -134,6 +135,6 @@ The review UI additionally produces `reviewed_annotations.json` (the cleaned, ke
 ## Notes
 
 - First run downloads the SAM 3 weights into the HuggingFace cache. Subsequent runs are fast.
-- The pipeline issues one SAM 3 concept query per ontology prompt and concatenates the per-prompt detections; each detection keeps its prompt's class, so overlapping detections from different prompts (e.g. a player also grounded by `soccer referee`) are all retained for the reviewer rather than deduped away.
+- The pipeline issues one SAM 3 concept query per ontology prompt (batched `sam3_batch_size` frames at a time) and concatenates the per-prompt detections; each detection keeps its prompt's class, so overlapping detections from different prompts (e.g. a player also grounded by `soccer referee`) are all retained for the reviewer rather than deduped away.
 - Recall-first by design: `sam3_score_threshold` is a low global floor and `class_thresholds` restores precision per class, keeping rare/ambiguous classes (referee, ball) for human review rather than dropping them outright.
 - This pipeline is intentionally a **labeler**, not a production detector. Output is meant to be reviewed/cleaned before training a custom downstream model.
