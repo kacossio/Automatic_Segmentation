@@ -2,8 +2,8 @@
 Text-prompted image segmentation using Meta SAM 3.
 
 SAM 3 promptable concept segmentation goes from text prompt straight to
-instance masks in one model — one call per ontology prompt. Produces COCO
-JSON output from per-image masks.
+instance masks in one model — one call per ontology prompt per batch of
+frames. Produces COCO JSON output from per-image masks.
 """
 import json
 import os
@@ -149,6 +149,11 @@ class Segmenter:
         # When false (default) nothing is dropped before human review: the
         # "one ball in play" rule becomes the reviewer's decision.
         self.apply_domain_filters: bool = bool(cfg.get("apply_domain_filters", False))
+        # Frames per SAM3 forward pass. The GPU is compute-bound on this
+        # model, so bigger batches only trim per-call overhead; going past
+        # the VRAM budget makes the driver spill to system RAM and runs
+        # many times SLOWER, so raise this cautiously.
+        self.sam3_batch_size: int = max(1, int(cfg.get("sam3_batch_size", 4)))
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -180,26 +185,45 @@ class Segmenter:
         return processor, model
 
     def predict_image(self, image_path: str, processor, model) -> sv.Detections:
-        det = self._predict_sam3(image_path, processor, model)
-        return self._apply_domain_filters(det) if self.apply_domain_filters else det
+        return self.predict_images([image_path], processor, model)[image_path]
 
-    def _predict_sam3(self, image_path: str, processor, model) -> sv.Detections:
-        """SAM 3 promptable concept segmentation, one call per ontology prompt.
+    def predict_images(
+        self, image_paths: List[str], processor, model
+    ) -> Dict[str, sv.Detections]:
+        dets = self._predict_sam3(image_paths, processor, model)
+        if self.apply_domain_filters:
+            dets = {p: self._apply_domain_filters(d) for p, d in dets.items()}
+        return dets
 
-        Mirrors the model card's documented usage:
-        ``processor(images=pil, text=prompt) -> model(**inputs) ->
-        post_process_instance_segmentation``. No vision-feature caching, no
-        bf16 autocast, no prefetch -- the model card pattern was already fast
-        on this dataset, and extra plumbing tended to make it slower.
+    def _predict_sam3(
+        self, image_paths: List[str], processor, model
+    ) -> Dict[str, sv.Detections]:
+        """SAM 3 promptable concept segmentation, one call per ontology prompt
+        per batch of frames.
+
+        Mirrors the model card's documented usage --
+        ``processor(images=pils, text=prompts) -> model(**inputs) ->
+        post_process_instance_segmentation`` -- with the batch dimension
+        carrying sam3_batch_size frames of the SAME prompt, so each call
+        still gets that prompt's single class_thresholds floor. No
+        vision-feature caching, no bf16 autocast, no prefetch -- those were
+        tried and made it slower on this dataset; same-prompt image batching
+        measured 1.10x over one-frame calls on an idle RTX 3090 (compute-
+        bound, so that is roughly the ceiling; 1.16x under desktop GPU load)
+        with outputs identical at batch 4.
         """
-        pil_image = Image.open(image_path).convert("RGB")
-        w, h = pil_image.size
-        self._image_wh[image_path] = (w, h)
+        pil_images: List[Image.Image] = []
+        for path in image_paths:
+            im = Image.open(path).convert("RGB")
+            self._image_wh[path] = im.size
+            pil_images.append(im)
+        target_sizes = [(im.size[1], im.size[0]) for im in pil_images]  # (h, w)
 
-        all_boxes: List[np.ndarray] = []
-        all_scores: List[np.ndarray] = []
-        all_masks: List[np.ndarray] = []
-        all_class_ids: List[np.ndarray] = []
+        # Per image: lists of per-prompt arrays, concatenated at the end.
+        boxes: List[List[np.ndarray]] = [[] for _ in image_paths]
+        scores: List[List[np.ndarray]] = [[] for _ in image_paths]
+        masks: List[List[np.ndarray]] = [[] for _ in image_paths]
+        class_ids: List[List[np.ndarray]] = [[] for _ in image_paths]
 
         for prompt, class_id in self.prompt_to_class_id.items():
             # Per-class confidence floor on top of sam3_score_threshold; classes
@@ -208,7 +232,9 @@ class Segmenter:
                 self.classes[class_id], self.sam3_score_threshold
             )
             inputs = processor(
-                images=pil_image, text=prompt, return_tensors="pt"
+                images=pil_images,
+                text=[prompt] * len(pil_images),
+                return_tensors="pt",
             ).to(self.device)
             with torch.inference_mode():
                 outputs = model(**inputs)
@@ -216,24 +242,30 @@ class Segmenter:
                 outputs,
                 threshold=floor,
                 mask_threshold=self.sam3_mask_threshold,
-                target_sizes=[(h, w)],
-            )[0]
-            if len(results["boxes"]) == 0:
+                target_sizes=target_sizes,
+            )
+            for i, res in enumerate(results):
+                if len(res["boxes"]) == 0:
+                    continue
+                boxes[i].append(res["boxes"].cpu().numpy())
+                scores[i].append(res["scores"].cpu().numpy())
+                masks[i].append(res["masks"].cpu().numpy().astype(bool))
+                class_ids[i].append(
+                    np.full(len(res["boxes"]), class_id, dtype=int)
+                )
+
+        out: Dict[str, sv.Detections] = {}
+        for i, path in enumerate(image_paths):
+            if not boxes[i]:
+                out[path] = sv.Detections.empty()
                 continue
-            all_boxes.append(results["boxes"].cpu().numpy())
-            all_scores.append(results["scores"].cpu().numpy())
-            all_masks.append(results["masks"].cpu().numpy().astype(bool))
-            all_class_ids.append(np.full(len(results["boxes"]), class_id, dtype=int))
-
-        if not all_boxes:
-            return sv.Detections.empty()
-
-        return sv.Detections(
-            xyxy=np.concatenate(all_boxes, axis=0).astype(float),
-            class_id=np.concatenate(all_class_ids, axis=0),
-            confidence=np.concatenate(all_scores, axis=0).astype(float),
-            mask=np.concatenate(all_masks, axis=0),
-        )
+            out[path] = sv.Detections(
+                xyxy=np.concatenate(boxes[i], axis=0).astype(float),
+                class_id=np.concatenate(class_ids[i], axis=0),
+                confidence=np.concatenate(scores[i], axis=0).astype(float),
+                mask=np.concatenate(masks[i], axis=0),
+            )
+        return out
 
     def _apply_domain_filters(self, det: sv.Detections) -> sv.Detections:
         """Soccer-specific post-filter for single-instance classes.
@@ -507,19 +539,39 @@ class Segmenter:
             print(f"Loading SAM 3 ({self.sam3_model_id}) on {self.device}...")
             processor, model = self.load_models()
 
-            with open(self._partial_path, "a") as partial:
-                for path in tqdm(todo, desc="Segmenting"):
+            bs = self.sam3_batch_size
+            with open(self._partial_path, "a") as partial, tqdm(
+                total=len(todo), desc="Segmenting", unit="img"
+            ) as pbar:
+                for start in range(0, len(todo), bs):
+                    chunk = todo[start : start + bs]
                     try:
-                        det = self.predict_image(path, processor, model)
-                        # RLE-encode now and drop the Detections (and its
+                        dets = self.predict_images(chunk, processor, model)
+                        # RLE-encode now and drop the Detections (and their
                         # full-res masks) so memory stays flat over the run.
-                        anns = self._detections_to_coco(det)
-                    except Exception as e:  # one bad image must not abort the batch
-                        anns = []
-                        failures.append(path)
-                        tqdm.write(f"FAILED {path}: {type(e).__name__}: {e}")
-                    self._frames[path] = anns
-                    self._append_partial(partial, path, anns)
+                        anns_by_path = {
+                            p: self._detections_to_coco(dets[p]) for p in chunk
+                        }
+                    except Exception:
+                        # One bad image (usually unreadable, so it fails at
+                        # load, before any GPU work) aborts its whole chunk's
+                        # forward pass; retry each frame alone so only the
+                        # bad one is written empty.
+                        anns_by_path = {}
+                        for p in chunk:
+                            try:
+                                det = self.predict_image(p, processor, model)
+                                anns_by_path[p] = self._detections_to_coco(det)
+                            except Exception as e:
+                                anns_by_path[p] = []
+                                failures.append(p)
+                                tqdm.write(
+                                    f"FAILED {p}: {type(e).__name__}: {e}"
+                                )
+                    for p in chunk:
+                        self._frames[p] = anns_by_path[p]
+                        self._append_partial(partial, p, anns_by_path[p])
+                    pbar.update(len(chunk))
 
         coco_path = self._write_coco(self._frames)
         print(f"Done. COCO annotations written to: {coco_path}")
